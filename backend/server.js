@@ -76,24 +76,56 @@ function chatKeyParts(a, b) {
   return a < b ? [a, b] : [b, a];
 }
 
-async function broadcastDirectory() {
+// --- Contacts (privacy) -----------------------------------------------
+// Nobody's username is ever broadcast to everyone. A user only appears in
+// your "New Chat" / "New Group" / Status list once you've added them by
+// their EXACT username or phone number (see search_users below). This
+// function replaces the old broadcastDirectory(), which used to send the
+// entire users table to every connected socket.
+async function getContactsFor(username) {
   const { rows } = await pool.query(
-    `SELECT u.username, u.is_online, u.last_seen,
+    `SELECT u.username, u.is_online, u.last_seen, u.avatar_url,
             COALESCE(s.show_last_seen, true) AS show_last_seen
-     FROM users u
+     FROM contacts c
+     JOIN users u ON u.username = c.contact_username
      LEFT JOIN user_settings s ON s.username = u.username
-     ORDER BY u.username`
+     WHERE c.owner_username = $1
+     ORDER BY u.username`,
+    [username]
   );
-  io.emit(
-    "directory",
-    rows.map((r) => ({
-      name: r.username,
-      online: r.is_online,
-      // Respect the "show last seen" privacy setting — if it's off, we
-      // simply don't send the timestamp at all (not just hide it in the UI).
-      lastSeen: r.show_last_seen ? r.last_seen.getTime() : null,
-    }))
-  );
+  return rows.map((r) => ({
+    name: r.username,
+    online: r.is_online,
+    avatarUrl: r.avatar_url || null,
+    // Respect the "show last seen" privacy setting — if it's off, we
+    // simply don't send the timestamp at all (not just hide it in the UI).
+    lastSeen: r.show_last_seen ? r.last_seen.getTime() : null,
+  }));
+}
+
+async function sendContactsTo(username) {
+  const sId = socketsByUser.get(username);
+  if (!sId) return;
+  io.to(sId).emit("directory", await getContactsFor(username));
+}
+
+// When something about `username` changes (comes online/offline, last-seen
+// setting, avatar), only the people who actually have them as a contact
+// need to know — not the whole user base.
+async function notifyContactsOf(username) {
+  const { rows } = await pool.query(`SELECT owner_username FROM contacts WHERE contact_username = $1`, [username]);
+  await Promise.all(rows.map((r) => sendContactsTo(r.owner_username)));
+}
+
+// Tell only the people who'd actually see this user's status (their
+// contacts, plus the poster themself) to refresh — not everyone.
+async function notifyStatusViewersOf(username) {
+  const { rows } = await pool.query(`SELECT owner_username FROM contacts WHERE contact_username = $1`, [username]);
+  const viewers = [username, ...rows.map((r) => r.owner_username)];
+  viewers.forEach((v) => {
+    const sId = socketsByUser.get(v);
+    if (sId) io.to(sId).emit("statuses_updated");
+  });
 }
 
 async function userGroups(username) {
@@ -140,91 +172,103 @@ async function getBlockedUsers(username) {
 // like WhatsApp shows a brand-new group right away). Each row carries the
 // last message preview, an unread count, and this user's pin/archive state.
 //
-// Note: this loops per-conversation with a few small queries each. That's
-// fine at demo scale; a high-traffic production version would collapse
-// this into one or two indexed queries instead.
+// This used to run 4 separate queries PER conversation in a loop — with
+// 20 chats that's 80+ sequential round trips to the database on every
+// single chat-list load, which is the main reason the app could feel slow.
+// Rewritten below as a small, fixed number of batched queries instead.
 async function getChatList(username) {
-  const results = [];
-
-  const { rows: partners } = await pool.query(
-    `SELECT DISTINCT CASE WHEN sender = $1 THEN receiver ELSE sender END AS other
-     FROM messages WHERE sender = $1 OR receiver = $1`,
+  const { rows: privateRows } = await pool.query(
+    `WITH partners AS (
+       SELECT DISTINCT CASE WHEN sender = $1 THEN receiver ELSE sender END AS other
+       FROM messages WHERE sender = $1 OR receiver = $1
+     ),
+     last_msgs AS (
+       SELECT DISTINCT ON (other) other, text, image, file_name, created_at
+       FROM (
+         SELECT CASE WHEN sender = $1 THEN receiver ELSE sender END AS other,
+                text, image, file_name, created_at
+         FROM messages WHERE sender = $1 OR receiver = $1
+       ) x
+       ORDER BY other, created_at DESC
+     ),
+     unread AS (
+       SELECT m.sender AS other, count(*)::int AS cnt
+       FROM messages m
+       LEFT JOIN read_state rs ON rs.username = $1 AND rs.scope = 'private' AND rs.conversation_key = m.sender
+       WHERE m.receiver = $1 AND m.created_at > COALESCE(rs.last_read_at, to_timestamp(0))
+       GROUP BY m.sender
+     )
+     SELECT p.other AS name,
+            lm.text, lm.image, lm.file_name AS "fileName", EXTRACT(EPOCH FROM lm.created_at)*1000 AS time,
+            COALESCE(uw.cnt, 0) AS "unreadCount",
+            COALESCE(cp.pinned, false) AS pinned, COALESCE(cp.archived, false) AS archived,
+            u.is_online AS online, u.avatar_url AS "avatarUrl",
+            CASE WHEN COALESCE(s.show_last_seen, true) THEN EXTRACT(EPOCH FROM u.last_seen)*1000 ELSE NULL END AS "lastSeen"
+     FROM partners p
+     LEFT JOIN last_msgs lm ON lm.other = p.other
+     LEFT JOIN unread uw ON uw.other = p.other
+     LEFT JOIN chat_preferences cp ON cp.username = $1 AND cp.scope = 'private' AND cp.conversation_key = p.other
+     LEFT JOIN users u ON u.username = p.other
+     LEFT JOIN user_settings s ON s.username = u.username`,
     [username]
   );
 
-  for (const { other } of partners) {
-    const { rows: lastMsg } = await pool.query(
-      `SELECT text, image, EXTRACT(EPOCH FROM created_at)*1000 AS time
-       FROM messages WHERE (sender = $1 AND receiver = $2) OR (sender = $2 AND receiver = $1)
-       ORDER BY created_at DESC LIMIT 1`,
-      [username, other]
-    );
-    const { rows: readRows } = await pool.query(
-      `SELECT last_read_at FROM read_state WHERE username = $1 AND scope = 'private' AND conversation_key = $2`,
-      [username, other]
-    );
-    const lastRead = readRows[0]?.last_read_at || new Date(0);
-    const { rows: unread } = await pool.query(
-      `SELECT count(*)::int AS cnt FROM messages WHERE receiver = $1 AND sender = $2 AND created_at > $3`,
-      [username, other, lastRead]
-    );
-    const { rows: pref } = await pool.query(
-      `SELECT pinned, archived FROM chat_preferences WHERE username = $1 AND scope = 'private' AND conversation_key = $2`,
-      [username, other]
-    );
-    const { rows: userRow } = await pool.query(
-      `SELECT u.is_online, u.last_seen, COALESCE(s.show_last_seen, true) AS show_last_seen
-       FROM users u LEFT JOIN user_settings s ON s.username = u.username
-       WHERE u.username = $1`,
-      [other]
-    );
-
-    results.push({
-      type: "user",
-      id: other,
-      name: other,
-      lastMessage: lastMsg[0]?.image ? "📷 Photo" : lastMsg[0]?.text || "",
-      lastMessageTime: lastMsg[0]?.time || 0,
-      unreadCount: unread[0]?.cnt || 0,
-      pinned: pref[0]?.pinned || false,
-      archived: pref[0]?.archived || false,
-      online: userRow[0]?.is_online || false,
-      lastSeen: userRow[0]?.show_last_seen && userRow[0]?.last_seen ? userRow[0].last_seen.getTime() : null,
-    });
-  }
+  const results = privateRows.map((r) => ({
+    type: "user",
+    id: r.name,
+    name: r.name,
+    avatarUrl: r.avatarUrl || null,
+    lastMessage: r.image ? "📷 Photo" : r.fileName ? `📎 ${r.fileName}` : r.text || "",
+    lastMessageTime: r.time || 0,
+    unreadCount: r.unreadCount || 0,
+    pinned: r.pinned || false,
+    archived: r.archived || false,
+    online: r.online || false,
+    lastSeen: r.lastSeen || null,
+  }));
 
   const groups = await userGroups(username);
-  for (const g of groups) {
-    const { rows: lastMsg } = await pool.query(
-      `SELECT text, image, EXTRACT(EPOCH FROM created_at)*1000 AS time
-       FROM group_messages WHERE group_id = $1 ORDER BY created_at DESC LIMIT 1`,
-      [g.id]
+  if (groups.length > 0) {
+    const groupIds = groups.map((g) => g.id);
+    const { rows: groupExtras } = await pool.query(
+      `WITH last_msgs AS (
+         SELECT DISTINCT ON (group_id) group_id, text, image, file_name, created_at
+         FROM group_messages WHERE group_id = ANY($2::uuid[])
+         ORDER BY group_id, created_at DESC
+       ),
+       unread AS (
+         SELECT gm.group_id, count(*)::int AS cnt
+         FROM group_messages gm
+         LEFT JOIN read_state rs ON rs.username = $1 AND rs.scope = 'group' AND rs.conversation_key = gm.group_id::text
+         WHERE gm.group_id = ANY($2::uuid[]) AND gm.sender != $1 AND gm.created_at > COALESCE(rs.last_read_at, to_timestamp(0))
+         GROUP BY gm.group_id
+       )
+       SELECT g.id AS group_id,
+              lm.text, lm.image, lm.file_name AS "fileName", EXTRACT(EPOCH FROM lm.created_at)*1000 AS time,
+              COALESCE(uw.cnt, 0) AS "unreadCount",
+              COALESCE(cp.pinned, false) AS pinned, COALESCE(cp.archived, false) AS archived
+       FROM unnest($2::uuid[]) AS g(id)
+       LEFT JOIN last_msgs lm ON lm.group_id = g.id
+       LEFT JOIN unread uw ON uw.group_id = g.id
+       LEFT JOIN chat_preferences cp ON cp.username = $1 AND cp.scope = 'group' AND cp.conversation_key = g.id::text`,
+      [username, groupIds]
     );
-    const { rows: readRows } = await pool.query(
-      `SELECT last_read_at FROM read_state WHERE username = $1 AND scope = 'group' AND conversation_key = $2`,
-      [username, g.id]
-    );
-    const lastRead = readRows[0]?.last_read_at || new Date(0);
-    const { rows: unread } = await pool.query(
-      `SELECT count(*)::int AS cnt FROM group_messages WHERE group_id = $1 AND sender != $2 AND created_at > $3`,
-      [g.id, username, lastRead]
-    );
-    const { rows: pref } = await pool.query(
-      `SELECT pinned, archived FROM chat_preferences WHERE username = $1 AND scope = 'group' AND conversation_key = $2`,
-      [username, g.id]
-    );
-
-    results.push({
-      type: "group",
-      id: g.id,
-      name: g.name,
-      lastMessage: lastMsg[0]?.image ? "📷 Photo" : lastMsg[0]?.text || "",
-      lastMessageTime: lastMsg[0]?.time || 0,
-      unreadCount: unread[0]?.cnt || 0,
-      pinned: pref[0]?.pinned || false,
-      archived: pref[0]?.archived || false,
+    const extrasById = new Map(groupExtras.map((r) => [r.group_id, r]));
+    groups.forEach((g) => {
+      const r = extrasById.get(g.id) || {};
+      results.push({
+        type: "group",
+        id: g.id,
+        name: g.name,
+        lastMessage: r.image ? "📷 Photo" : r.fileName ? `📎 ${r.fileName}` : r.text || "",
+        lastMessageTime: r.time || 0,
+        unreadCount: r.unreadCount || 0,
+        pinned: r.pinned || false,
+        archived: r.archived || false,
+      });
     });
   }
+
 
   results.sort((a, b) => {
     if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
@@ -255,12 +299,22 @@ app.get("/health/db", async (req, res) => {
 
 app.post("/api/v1/auth/register", async (req, res) => {
   try {
-    const { username, password } = req.body || {};
-    const result = await auth.registerUser(username, password);
+    const { username, password, phone } = req.body || {};
+    const result = await auth.registerUser(username, password, phone);
     res.json(result);
   } catch (e) {
     res.status(400).json({ error: e.message });
   }
+});
+
+// Simple version-check endpoint for the in-app "Check for update" button —
+// configure these via env vars once you cut a new release.
+app.get("/api/v1/app/version", (req, res) => {
+  res.json({
+    latestVersion: process.env.APP_LATEST_VERSION || "1.0.0",
+    downloadUrl: process.env.APP_DOWNLOAD_URL || "",
+    notes: process.env.APP_UPDATE_NOTES || "",
+  });
 });
 
 app.post("/api/v1/auth/login", async (req, res) => {
@@ -293,6 +347,42 @@ app.post("/api/v1/media/upload", requireAuth, async (req, res) => {
   try {
     const { image } = req.body || {};
     const url = await media.uploadImageFromDataUrl(image);
+    res.json({ url });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+// Profile picture upload — same auth + storage as a chat photo, kept as a
+// separate route so the mobile app can tell the two apart if it ever needs to.
+app.post("/api/v1/media/upload-avatar", requireAuth, async (req, res) => {
+  try {
+    const { image } = req.body || {};
+    const url = await media.uploadImageFromDataUrl(image);
+    await pool.query(`UPDATE users SET avatar_url = $1 WHERE username = $2`, [url, req.username]);
+    res.json({ url });
+    await notifyContactsOf(req.username);
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+// Status photo/video upload.
+app.post("/api/v1/media/upload-status", requireAuth, async (req, res) => {
+  try {
+    const { media: dataUrl } = req.body || {};
+    const result = await media.uploadStatusMediaFromDataUrl(dataUrl);
+    res.json(result);
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+// Any other file (PDF, doc, zip, etc.) sent in a chat.
+app.post("/api/v1/media/upload-file", requireAuth, async (req, res) => {
+  try {
+    const { file, fileName } = req.body || {};
+    const url = await media.uploadFileFromDataUrl(file, fileName);
     res.json({ url });
   } catch (e) {
     res.status(400).json({ error: e.message });
@@ -389,7 +479,8 @@ io.on("connection", (socket) => {
         [currentUser]
       );
       socket.emit("authenticated", { username: currentUser });
-      await broadcastDirectory();
+      await sendContactsTo(currentUser); // your own contacts list, not everyone's
+      await notifyContactsOf(currentUser); // tell people who have you added that you're online
       await broadcastGroupsTo(currentUser);
     } catch (e) {
       socket.emit("auth_error", "Session expired or invalid — please log in again.");
@@ -401,6 +492,7 @@ io.on("connection", (socket) => {
       if (!currentUser || !otherUser) return;
       const { rows } = await pool.query(
         `SELECT m.id, m.sender AS "from", m.text, m.image,
+                m.file_url AS "fileUrl", m.file_name AS "fileName", m.file_type AS "fileType",
                 EXTRACT(EPOCH FROM m.created_at)*1000 AS time,
                 m.reply_to_id AS "replyToId", m.reply_to_sender AS "replyToSender", m.reply_to_text AS "replyToText",
                 EXTRACT(EPOCH FROM m.edited_at)*1000 AS "editedAt",
@@ -486,7 +578,7 @@ io.on("connection", (socket) => {
         [currentUser, !!showLastSeen, !!showReadReceipts, !!aiEnabled]
       );
       socket.emit("settings", { showLastSeen: !!showLastSeen, showReadReceipts: !!showReadReceipts, aiEnabled: !!aiEnabled });
-      await broadcastDirectory(); // last-seen visibility may have just changed
+      await notifyContactsOf(currentUser); // last-seen visibility may have just changed
     } catch (e) {
       console.error("update_settings error", e);
     }
@@ -547,16 +639,104 @@ io.on("connection", (socket) => {
     }
   });
 
-  socket.on("post_status", async ({ text }) => {
+  // --- Contacts (privacy) ---
+  // The ONLY way to find another user: type their exact username or exact
+  // phone number. No partial/prefix search — that would let someone "browse"
+  // for people the same way the old full-directory broadcast did.
+  socket.on("search_users", async ({ query }) => {
     try {
-      if (!currentUser || !text) return;
-      const cleanText = sanitizeText(text).slice(0, 700);
-      if (!cleanText) return;
-      await pool.query(
-        `INSERT INTO statuses (username, text, expires_at) VALUES ($1, $2, now() + interval '24 hours')`,
-        [currentUser, cleanText]
+      if (!currentUser || !query) return socket.emit("user_search_result", null);
+      const q = String(query).trim();
+      if (!q) return socket.emit("user_search_result", null);
+      const { rows } = await pool.query(
+        `SELECT username, avatar_url, is_online FROM users
+         WHERE (lower(username) = lower($1) OR phone_number = $1) AND username != $2`,
+        [q, currentUser]
       );
-      io.emit("statuses_updated");
+      socket.emit("user_search_result", rows[0]
+        ? { name: rows[0].username, avatarUrl: rows[0].avatar_url, online: rows[0].is_online }
+        : null);
+    } catch (e) {
+      console.error("search_users error", e);
+    }
+  });
+
+  socket.on("get_contacts", async () => {
+    if (!currentUser) return;
+    socket.emit("directory", await getContactsFor(currentUser));
+  });
+
+  socket.on("add_contact", async ({ username }) => {
+    try {
+      if (!currentUser || !username || username === currentUser) return;
+      const { rows } = await pool.query(`SELECT username FROM users WHERE username = $1`, [username]);
+      if (rows.length === 0) {
+        socket.emit("auth_error_scoped", { message: "No such user." });
+        return;
+      }
+      await pool.query(
+        `INSERT INTO contacts (owner_username, contact_username) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+        [currentUser, username]
+      );
+      await sendContactsTo(currentUser);
+    } catch (e) {
+      console.error("add_contact error", e);
+    }
+  });
+
+  socket.on("remove_contact", async ({ username }) => {
+    try {
+      if (!currentUser || !username) return;
+      await pool.query(`DELETE FROM contacts WHERE owner_username = $1 AND contact_username = $2`, [currentUser, username]);
+      await sendContactsTo(currentUser);
+    } catch (e) {
+      console.error("remove_contact error", e);
+    }
+  });
+
+  // --- Profile ---
+  socket.on("get_profile", async () => {
+    try {
+      if (!currentUser) return;
+      const { rows } = await pool.query(
+        `SELECT username, avatar_url AS "avatarUrl", phone_number AS "phoneNumber" FROM users WHERE username = $1`,
+        [currentUser]
+      );
+      socket.emit("profile", rows[0] || null);
+    } catch (e) {
+      console.error("get_profile error", e);
+    }
+  });
+
+  socket.on("update_phone", async ({ phone }) => {
+    try {
+      if (!currentUser) return;
+      const digits = phone ? String(phone).replace(/[^\d+]/g, "") : null;
+      if (digits && (digits.length < 7 || digits.length > 16)) {
+        socket.emit("auth_error_scoped", { message: "Phone number should be 7-16 digits." });
+        return;
+      }
+      await pool.query(`UPDATE users SET phone_number = $1 WHERE username = $2`, [digits, currentUser]);
+      socket.emit("profile_updated", { phoneNumber: digits });
+    } catch (e) {
+      if (e.code === "23505") {
+        socket.emit("auth_error_scoped", { message: "This phone number is already registered." });
+      } else {
+        console.error("update_phone error", e);
+      }
+    }
+  });
+
+  socket.on("post_status", async ({ text, mediaUrl, mediaType }) => {
+    try {
+      if (!currentUser || (!text && !mediaUrl)) return;
+      const cleanText = text ? sanitizeText(text).slice(0, 700) : null;
+      await pool.query(
+        `INSERT INTO statuses (username, text, media_url, media_type, expires_at)
+         VALUES ($1, $2, $3, $4, now() + interval '24 hours')`,
+        [currentUser, cleanText, mediaUrl || null, mediaType || null]
+      );
+      await notifyStatusViewersOf(currentUser);
     } catch (e) {
       console.error("post_status error", e);
     }
@@ -565,11 +745,15 @@ io.on("connection", (socket) => {
   socket.on("get_statuses", async () => {
     try {
       if (!currentUser) return;
+      // Only your own statuses and your contacts' — never everyone's.
       const { rows } = await pool.query(
-        `SELECT s.id, s.username, s.text, EXTRACT(EPOCH FROM s.created_at)*1000 AS "createdAt"
+        `SELECT s.id, s.username, s.text, s.media_url AS "mediaUrl", s.media_type AS "mediaType",
+                EXTRACT(EPOCH FROM s.created_at)*1000 AS "createdAt"
          FROM statuses s
          WHERE s.expires_at > now()
-         ORDER BY s.created_at DESC`
+           AND (s.username = $1 OR s.username IN (SELECT contact_username FROM contacts WHERE owner_username = $1))
+         ORDER BY s.created_at DESC`,
+        [currentUser]
       );
       socket.emit("statuses", rows);
     } catch (e) {
@@ -581,7 +765,7 @@ io.on("connection", (socket) => {
     try {
       if (!currentUser || !statusId) return;
       await pool.query(`DELETE FROM statuses WHERE id = $1 AND username = $2`, [statusId, currentUser]);
-      io.emit("statuses_updated");
+      await notifyStatusViewersOf(currentUser);
     } catch (e) {
       console.error("delete_status error", e);
     }
@@ -636,9 +820,9 @@ io.on("connection", (socket) => {
     }
   });
 
-  socket.on("private_message", async ({ to, text, image, replyTo }) => {
+  socket.on("private_message", async ({ to, text, image, fileUrl, fileName, fileType, replyTo }) => {
     try {
-      if (!currentUser || !to || (!text && !image)) return;
+      if (!currentUser || !to || (!text && !image && !fileUrl)) return;
       if (isRateLimited(currentUser)) {
         socket.emit("rate_limited", { message: "You're sending messages too fast — slow down." });
         return;
@@ -654,15 +838,19 @@ io.on("connection", (socket) => {
         return;
       }
       const { rows } = await pool.query(
-        `INSERT INTO messages (sender, receiver, text, image, reply_to_id, reply_to_sender, reply_to_text)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
-         RETURNING id, sender AS "from", text, image, EXTRACT(EPOCH FROM created_at)*1000 AS time,
+        `INSERT INTO messages (sender, receiver, text, image, file_url, file_name, file_type, reply_to_id, reply_to_sender, reply_to_text)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+         RETURNING id, sender AS "from", text, image, file_url AS "fileUrl", file_name AS "fileName", file_type AS "fileType",
+                   EXTRACT(EPOCH FROM created_at)*1000 AS time,
                    reply_to_id AS "replyToId", reply_to_sender AS "replyToSender", reply_to_text AS "replyToText"`,
         [
           currentUser,
           to,
           sanitizeText(text),
           image || null,
+          fileUrl || null,
+          fileName ? String(fileName).slice(0, 200) : null,
+          fileType ? String(fileType).slice(0, 100) : null,
           replyTo?.id || null,
           replyTo?.sender ? String(replyTo.sender).slice(0, 100) : null,
           replyTo?.text ? sanitizeText(replyTo.text).slice(0, 200) : null,
@@ -680,7 +868,7 @@ io.on("connection", (socket) => {
       // is already open).
       push.sendPushToUser(to, {
         title: currentUser,
-        body: message.image ? "📷 Photo" : message.text,
+        body: message.image ? "📷 Photo" : message.fileUrl ? `📎 ${message.fileName || "File"}` : message.text,
         data: { type: "private", conversationKey: currentUser },
       });
     } catch (e) {
@@ -1066,6 +1254,7 @@ io.on("connection", (socket) => {
       }
       const { rows } = await pool.query(
         `SELECT gm.id, gm.sender AS "from", gm.text, gm.image,
+                gm.file_url AS "fileUrl", gm.file_name AS "fileName", gm.file_type AS "fileType",
                 EXTRACT(EPOCH FROM gm.created_at)*1000 AS time,
                 gm.reply_to_id AS "replyToId", gm.reply_to_sender AS "replyToSender", gm.reply_to_text AS "replyToText",
                 EXTRACT(EPOCH FROM gm.edited_at)*1000 AS "editedAt",
@@ -1088,9 +1277,9 @@ io.on("connection", (socket) => {
     }
   });
 
-  socket.on("group_message", async ({ groupId, text, image, replyTo }) => {
+  socket.on("group_message", async ({ groupId, text, image, fileUrl, fileName, fileType, replyTo }) => {
     try {
-      if (!currentUser || !groupId || (!text && !image)) return;
+      if (!currentUser || !groupId || (!text && !image && !fileUrl)) return;
       if (isRateLimited(currentUser)) {
         socket.emit("rate_limited", { message: "You're sending messages too fast — slow down." });
         return;
@@ -1102,15 +1291,19 @@ io.on("connection", (socket) => {
       if (memberCheck.length === 0) return; // not a member — reject
 
       const { rows } = await pool.query(
-        `INSERT INTO group_messages (group_id, sender, text, image, reply_to_id, reply_to_sender, reply_to_text)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
-         RETURNING id, sender AS "from", text, image, EXTRACT(EPOCH FROM created_at)*1000 AS time,
+        `INSERT INTO group_messages (group_id, sender, text, image, file_url, file_name, file_type, reply_to_id, reply_to_sender, reply_to_text)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+         RETURNING id, sender AS "from", text, image, file_url AS "fileUrl", file_name AS "fileName", file_type AS "fileType",
+                   EXTRACT(EPOCH FROM created_at)*1000 AS time,
                    reply_to_id AS "replyToId", reply_to_sender AS "replyToSender", reply_to_text AS "replyToText"`,
         [
           groupId,
           currentUser,
           sanitizeText(text),
           image || null,
+          fileUrl || null,
+          fileName ? String(fileName).slice(0, 200) : null,
+          fileType ? String(fileType).slice(0, 100) : null,
           replyTo?.id || null,
           replyTo?.sender ? String(replyTo.sender).slice(0, 100) : null,
           replyTo?.text ? sanitizeText(replyTo.text).slice(0, 200) : null,
@@ -1133,7 +1326,7 @@ io.on("connection", (socket) => {
         .forEach(({ username }) => {
           push.sendPushToUser(username, {
             title: groupName,
-            body: `${currentUser}: ${message.image ? "📷 Photo" : message.text}`,
+            body: `${currentUser}: ${message.image ? "📷 Photo" : message.fileUrl ? `📎 ${message.fileName || "File"}` : message.text}`,
             data: { type: "group", conversationKey: groupId },
           });
         });
@@ -1156,7 +1349,7 @@ io.on("connection", (socket) => {
           `UPDATE users SET is_online = false, last_seen = now() WHERE username = $1`,
           [currentUser]
         );
-        await broadcastDirectory();
+        await notifyContactsOf(currentUser);
       }
     } catch (e) {
       console.error("disconnect error", e);
